@@ -2,17 +2,23 @@
 Functions for explaining classifiers that use tabular data (matrices).
 """
 import collections
-import json
 import copy
+import json
+
 import numpy as np
 import sklearn
 import sklearn.preprocessing
-from . import lime_base
+
+from lime.discretize import QuartileDiscretizer
+from lime.discretize import DecileDiscretizer
+from lime.discretize import EntropyDiscretizer
 from . import explanation
+from . import lime_base
 
 
 class TableDomainMapper(explanation.DomainMapper):
     """Maps feature ids to names, generates table views, etc"""
+
     def __init__(self, feature_names, feature_values, scaled_row,
                  categorical_features, discretized_feature_names=None):
         """Init.
@@ -68,7 +74,7 @@ class TableDomainMapper(explanation.DomainMapper):
         for x in exp:
             weights[x[0]] = x[1]
         out_list = list(zip(self.exp_feature_names, self.feature_values,
-                        weights))
+                            weights))
         if not show_all:
             out_list = [out_list[x[0]] for x in exp]
         ret = u'''
@@ -85,14 +91,18 @@ class LimeTabularExplainer(object):
     sampling according to the training distribution, and making a binary
     feature that is 1 when the value is the same as the instance being
     explained."""
-    def __init__(self, training_data, feature_names=None,
+
+    def __init__(self, training_data, training_labels=None, feature_names=None,
                  categorical_features=None, categorical_names=None,
-                 kernel_width=3, verbose=False, class_names=None,
-                 feature_selection='auto', discretize_continuous=True):
+                 kernel_width=None, verbose=False, class_names=None,
+                 feature_selection='auto', discretize_continuous=True,
+                 discretizer='quartile'):
         """Init function.
 
         Args:
             training_data: numpy 2d array
+            training_labels: labels for training data. Not required, but may be
+                used by discretizer.
             feature_names: list of names (strings) corresponding to the columns
                 in the training data.
             categorical_features: list of indices (ints) corresponding to the
@@ -101,7 +111,8 @@ class LimeTabularExplainer(object):
             categorical_names: map from int to list of names, where
                 categorical_names[x][y] represents the name of the yth value of
                 column x.
-            kernel_width: kernel width for the exponential kernel
+            kernel_width: kernel width for the exponential kernel.
+            If None, defaults to sqrt(number of columns) * 0.75
             verbose: if true, print local prediction values from linear model
             class_names: list of class names, ordered according to whatever the
                 classifier is using. If not present, class names will be '0',
@@ -112,6 +123,8 @@ class LimeTabularExplainer(object):
                 details on what each of the options does.
             discretize_continuous: if True, all non-categorical features will
                 be discretized into quartiles.
+            discretizer: only matters if discretize_continuous is True. Options
+                are 'quartile', 'decile' or 'entropy'
         """
         self.categorical_names = categorical_names
         self.categorical_features = categorical_features
@@ -121,14 +134,32 @@ class LimeTabularExplainer(object):
             self.categorical_features = []
         self.discretizer = None
         if discretize_continuous:
-            self.discretizer = QuartileDiscretizer(training_data,
-                                                   self.categorical_features,
-                                                   feature_names)
+            if discretizer == 'quartile':
+                self.discretizer = QuartileDiscretizer(
+                    training_data, self.categorical_features, feature_names,
+                    labels=training_labels)
+            elif discretizer == 'decile':
+                self.discretizer = DecileDiscretizer(
+                    training_data, self.categorical_features, feature_names,
+                    labels=training_labels)
+            elif discretizer == 'entropy':
+                self.discretizer = EntropyDiscretizer(
+                    training_data, self.categorical_features, feature_names,
+                    labels=training_labels)
+            else:
+                raise ValueError('''Discretizer must be 'quartile',''' +
+                                 ''' 'decile' or 'entropy' ''')
             self.categorical_features = range(training_data.shape[1])
             discretized_training_data = self.discretizer.discretize(
                 training_data)
 
-        def kernel(d): return np.sqrt(np.exp(-(d**2) / kernel_width ** 2))
+        if kernel_width is None:
+            kernel_width = np.sqrt(training_data.shape[1]) * .75
+        kernel_width = float(kernel_width)
+
+        def kernel(d):
+            return np.sqrt(np.exp(-(d ** 2) / kernel_width ** 2))
+
         self.feature_selection = feature_selection
         self.base = lime_base.LimeBase(kernel, verbose)
         self.scaler = None
@@ -170,7 +201,7 @@ class LimeTabularExplainer(object):
         Args:
             data_row: 1d numpy array, corresponding to a row
             classifier_fn: classifier prediction probability function, which
-                takes a string and outputs prediction probabilities.  For
+                takes a numpy array and outputs prediction probabilities.  For
                 ScikitClassifiers , this is classifier.predict_proba.
             labels: iterable with labels to be explained.
             top_labels: if not None, ignore labels and produce explanations for
@@ -205,8 +236,7 @@ class LimeTabularExplainer(object):
         if feature_names is None:
             feature_names = [str(x) for x in range(data_row.shape[0])]
 
-        def round_stuff(x): return ['%.2f' % a for a in x]
-        values = round_stuff(data_row)
+        values = ['%.2f' % a for a in data_row]
         for i in self.categorical_features:
             if self.discretizer is not None and i in self.discretizer.lambdas:
                 continue
@@ -299,88 +329,138 @@ class LimeTabularExplainer(object):
         return data, inverse
 
 
-class QuartileDiscretizer:
-    """Discretizes data into quartiles."""
-    def __init__(self, data, categorical_features, feature_names):
-        """Initializer
+class RecurrentTabularExplainer(LimeTabularExplainer):
+    """
+    An explainer for keras-style recurrent neural networks, where the
+    input shape is (n_samples, n_timesteps, n_features). This class
+    just extends the LimeTabularExplainer class and reshapes the training
+    data and feature names such that they become something like
+
+    (val1_t1, val1_t2, val1_t3, ..., val2_t1, ..., valn_tn)
+
+    Each of the methods that take data reshape it appropriately,
+    so you can pass in the training/testing data exactly as you
+    would to the recurrent neural network.
+
+    """
+    def __init__(self, training_data, training_labels=None, feature_names=None,
+                 categorical_features=None, categorical_names=None,
+                 kernel_width=None, verbose=False, class_names=None,
+                 feature_selection='auto', discretize_continuous=True,
+                 discretizer='quartile'):
+        """
 
         Args:
-            data: numpy 2d array
+            training_data: numpy 3d array with shape
+                (n_samples, n_timesteps, n_features)
+            training_labels: labels for training data. Not required, but may be
+                used by discretizer.
+            feature_names: list of names (strings) corresponding to the columns
+                in the training data.
             categorical_features: list of indices (ints) corresponding to the
-                categorical columns. These features will not be discretized.
-                Everything else will be considered continuous, and will be
-                discretized.
+                categorical columns. Everything else will be considered
+                continuous. Values in these columns MUST be integers.
             categorical_names: map from int to list of names, where
                 categorical_names[x][y] represents the name of the yth value of
                 column x.
-            feature_names: list of names (strings) corresponding to the columns
-                in the training data.
+            kernel_width: kernel width for the exponential kernel.
+            If None, defaults to sqrt(number of columns) * 0.75
+            verbose: if true, print local prediction values from linear model
+            class_names: list of class names, ordered according to whatever the
+                classifier is using. If not present, class names will be '0',
+                '1', ...
+            feature_selection: feature selection method. can be
+                'forward_selection', 'lasso_path', 'none' or 'auto'.
+                See function 'explain_instance_with_data' in lime_base.py for
+                details on what each of the options does.
+            discretize_continuous: if True, all non-categorical features will
+                be discretized into quartiles.
+            discretizer: only matters if discretize_continuous is True. Options
+                are 'quartile', 'decile' or 'entropy'
         """
-        to_discretize = ([x for x in range(data.shape[1])
-                         if x not in categorical_features])
-        self.names = {}
-        self.lambdas = {}
-        self.ranges = {}
-        self.means = {}
-        self.stds = {}
-        self.mins = {}
-        self.maxs = {}
-        for feature in to_discretize:
-            qts = np.percentile(data[:, feature], [25, 50, 75])
-            boundaries = np.min(data[:, feature]), np.max(data[:, feature])
-            name = feature_names[feature]
-            self.names[feature] = (
-                ['%s <= %.2f' % (name, qts[0]),
-                 '%.2f < %s <= %.2f' % (qts[0], name, qts[1]),
-                 '%.2f < %s <= %.2f' % (qts[1], name, qts[2]),
-                 '%s > %.2f' % (name, qts[2])])
-            self.lambdas[feature] = lambda x, qts=qts: np.searchsorted(qts, x)
-            discretized = self.lambdas[feature](data[:, feature])
-            self.means[feature] = []
-            self.stds[feature] = []
-            for x in range(4):
-                selection = data[discretized == x, feature]
-                mean = 0 if len(selection) == 0 else np.mean(selection)
-                self.means[feature].append(mean)
-                std = 0 if len(selection) == 0 else np.std(selection)
-                std += 0.00000000001
-                self.stds[feature].append(std)
-            self.mins[feature] = [boundaries[0], qts[0], qts[1], qts[2]]
-            self.maxs[feature] = [qts[0], qts[1], qts[2], boundaries[1]]
 
-    def discretize(self, data):
-        """Discretizes the data.
+        # Reshape X
+        n_samples, n_timesteps, n_features = training_data.shape
+        training_data = np.transpose(training_data, axes=(0, 2, 1)).reshape(
+            n_samples, n_timesteps * n_features)
+        self.n_timesteps = n_timesteps
+        self.n_features = n_features
+
+        # Update the feature names
+        feature_names = ['{}_t-{}'.format(n, n_timesteps - (i + 1))
+                         for n in feature_names for i in range(n_timesteps)]
+
+        # Send off the the super class to do its magic.
+        super(RecurrentTabularExplainer, self).__init__(
+            training_data,
+            training_labels=training_labels,
+            feature_names=feature_names,
+            categorical_features=categorical_features,
+            categorical_names=categorical_names,
+            kernel_width=kernel_width, verbose=verbose,
+            class_names=class_names,
+            feature_selection=feature_selection,
+            discretize_continuous=discretize_continuous,
+            discretizer=discretizer)
+
+    def _make_predict_proba(self, func):
+        """
+        The predict_proba method will expect 3d arrays, but we are reshaping
+        them to 2D so that LIME works correctly. This wraps the function
+        you give in explain_instance to first reshape the data to have
+        the shape the the keras-style network expects.
+        """
+
+        def predict_proba(X):
+            n_samples = X.shape[0]
+            new_shape = (n_samples, self.n_features, self.n_timesteps)
+            X = np.transpose(X.reshape(new_shape), axes=(0, 2, 1))
+            return func(X)
+
+        return predict_proba
+
+    def explain_instance(self, data_row, classifier_fn, labels=(1,),
+                         top_labels=None, num_features=10, num_samples=5000,
+                         distance_metric='euclidean', model_regressor=None):
+        """Generates explanations for a prediction.
+
+        First, we generate neighborhood data by randomly perturbing features
+        from the instance (see __data_inverse). We then learn locally weighted
+        linear models on this neighborhood data to explain each of the classes
+        in an interpretable way (see lime_base.py).
 
         Args:
-            data: numpy 2d or 1d array
+            data_row: 2d numpy array, corresponding to a row
+            classifier_fn: classifier prediction probability function, which
+                takes a numpy array and outputs prediction probabilities.  For
+                ScikitClassifiers , this is classifier.predict_proba.
+            labels: iterable with labels to be explained.
+            top_labels: if not None, ignore labels and produce explanations for
+                the K labels with highest prediction probabilities, where K is
+                this parameter.
+            num_features: maximum number of features present in explanation
+            num_samples: size of the neighborhood to learn the linear model
+            distance_metric: the distance metric to use for weights.
+            model_regressor: sklearn regressor to use in explanation. Defaults
+                to Ridge regression in LimeBase. Must have
+                model_regressor.coef_ and 'sample_weight' as a parameter
+                to model_regressor.fit()
 
         Returns:
-            numpy array of same dimension, discretized.
+            An Explanation object (see explanation.py) with the corresponding
+            explanations.
         """
-        ret = data.copy()
-        for feature in self.lambdas:
-            if len(data.shape) == 1:
-                ret[feature] = int(self.lambdas[feature](ret[feature]))
-            else:
-                ret[:, feature] = self.lambdas[feature](
-                    ret[:, feature]).astype(int)
-        return ret
 
-    def undiscretize(self, data):
-        ret = data.copy()
-        for feature in self.means:
-            mins = self.mins[feature]
-            maxs = self.maxs[feature]
-            means = self.means[feature]
-            stds = self.stds[feature]
+        # Flatten input so that the normal explainer can handle it
+        data_row = data_row.T.reshape(self.n_timesteps * self.n_features)
 
-            def get_inverse(q): return max(
-                mins[q],
-                min(np.random.normal(means[q], stds[q]), maxs[q]))
-            if len(data.shape) == 1:
-                q = int(ret[feature])
-                ret[feature] = get_inverse(q)
-            else:
-                ret[:, feature] = (
-                    [get_inverse(int(x)) for x in ret[:, feature]])
-        return ret
+        # Wrap the classifier to reshape input
+        classifier_fn = self._make_predict_proba(classifier_fn)
+        return super(RecurrentTabularExplainer, self).explain_instance(
+            data_row, classifier_fn,
+            labels=labels,
+            top_labels=top_labels,
+            num_features=num_features,
+            num_samples=num_samples,
+            distance_metric=distance_metric,
+            model_regressor=model_regressor)

@@ -2,18 +2,22 @@
 Functions for explaining text classifiers.
 """
 from __future__ import unicode_literals
-import json
-import numpy as np
-import re
+
 import itertools
+import json
+import re
+
+import numpy as np
 import scipy as sp
 import sklearn
-from . import lime_base
+
 from . import explanation
+from . import lime_base
 
 
 class TextDomainMapper(explanation.DomainMapper):
     """Maps feature ids to words or word-positions"""
+
     def __init__(self, indexed_string):
         """Initializer.
 
@@ -76,6 +80,7 @@ class TextDomainMapper(explanation.DomainMapper):
 
 class IndexedString(object):
     """String with various indexes."""
+
     def __init__(self, raw_string, split_expression=r'\W+', bow=True):
         """Initializer.
 
@@ -168,6 +173,7 @@ class LimeTextExplainer(object):
     """Explains text classifiers.
        Currently, we are using an exponential kernel on cosine distance, and
        restricting explanations to words that are present in documents."""
+
     def __init__(self,
                  kernel_width=25,
                  verbose=False,
@@ -195,8 +201,10 @@ class LimeTextExplainer(object):
                 it appears and uninportant the second. Only set to false if the
                 classifier uses word order in some way (bigrams, etc).
         """
+
         # exponential kernel
-        def kernel(d): return np.sqrt(np.exp(-(d**2) / kernel_width ** 2))
+        def kernel(d): return np.sqrt(np.exp(-(d ** 2) / kernel_width ** 2))
+
         self.base = lime_base.LimeBase(kernel, verbose)
         self.class_names = class_names
         self.vocabulary = None
@@ -223,8 +231,9 @@ class LimeTextExplainer(object):
         Args:
             text_instance: raw text string to be explained.
             classifier_fn: classifier prediction probability function, which
-                takes a string and outputs prediction probabilities.  For
-                ScikitClassifiers , this is classifier.predict_proba.
+                takes a list of d strings and outputs a (d, k) numpy array with
+                prediction probabilities, where k is the number of classes.
+                For ScikitClassifiers , this is classifier.predict_proba.
             labels: iterable with labels to be explained.
             top_labels: if not None, ignore labels and produce explanations for
                 the K labels with highest prediction probabilities, where K is
@@ -296,9 +305,11 @@ class LimeTextExplainer(object):
                     each perturbed instance (computed in the binary 'data'
                     matrix), times 100.
         """
+
         def distance_fn(x):
             return sklearn.metrics.pairwise.pairwise_distances(
                 x, x[0], metric=distance_metric).ravel() * 100
+
         doc_size = indexed_string.num_words()
         sample = np.random.randint(1, doc_size + 1, num_samples - 1)
         data = np.ones((num_samples, doc_size))
